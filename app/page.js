@@ -5,39 +5,126 @@ import Navbar from '@/components/Navbar';
 import HomeTab from '@/components/HomeTab';
 import GameActionsTab from '@/components/GameActionsTab';
 import { useAccount } from 'wagmi';
-
-const mockGames = [
-  {
-    id: 1,
-    name: 'Weekend Warriors',
-    depositAmount: '0.1',
-    duration: '7 days',
-    participants: 5,
-    maxParticipants: 5,
-    status: 'active',
-    creator: '0x1234...5678',
-  },
-  {
-    id: 2,
-    name: 'Monthly Madness',
-    depositAmount: '0.5',
-    duration: '30 days',
-    participants: 2,
-    maxParticipants: 10,
-    status: 'pending',
-    creator: '0xabcd...efgh',
-  },
-];
+import { supabase } from '@/lib/supabase';
 
 export default function Home() {
   const { address, isConnected } = useAccount();
-  const [games, setGames] = useState(mockGames);
+  const [games, setGames] = useState([]);
   const [activeTab, setActiveTab] = useState('home');
+  const [loading, setLoading] = useState(true);
   const [userStats, setUserStats] = useState({
     totalDeposited: '0',
     potentialWinnings: '0.00',
     activeGames: 0,
   });
+
+  // Fetch games and set up real-time subscription
+  useEffect(() => {
+    fetchGames();
+    
+    // Set up real-time subscription
+    const subscription = supabase
+      .channel('games-channel')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'games' },
+        (payload) => {
+          console.log('Game change received:', payload);
+          fetchGames(); // Refetch all games when any change occurs
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'game_participants' },
+        (payload) => {
+          console.log('Participant change received:', payload);
+          fetchGames(); // Refetch when participants change
+        }
+      )
+      .subscribe();
+
+    // Cleanup subscription on unmount
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // Update user stats when address or games change
+  useEffect(() => {
+    if (address && games.length > 0) {
+      updateUserStats(games);
+    }
+  }, [address, games]);
+
+  const fetchGames = async () => {
+    try {
+      setLoading(true);
+      console.log('Fetching games from Supabase...');
+      
+      const { data: gamesData, error } = await supabase
+        .from('games')
+        .select(`
+          *,
+          creator:users!creator_id(wallet_address, username),
+          game_participants(*)
+        `)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.error('Supabase error:', error);
+        throw error;
+      }
+      
+      console.log('Fetched games:', gamesData);
+      setGames(gamesData || []);
+    } catch (error) {
+      console.error('Error fetching games:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const updateUserStats = async (allGames) => {
+    if (!address) return;
+    
+    try {
+      // Get user record
+      const { data: userData } = await supabase
+        .from('users')
+        .select('id')
+        .eq('wallet_address', address.toLowerCase())
+        .single();
+
+      if (!userData) {
+        console.log('No user found for wallet:', address);
+        return;
+      }
+
+      // Get user's participations
+      const { data: participations } = await supabase
+        .from('game_participants')
+        .select('*, games(*)')
+        .eq('user_id', userData.id);
+
+      console.log('User participations:', participations);
+
+      const activeGames = participations?.filter(p => 
+        p.games?.status === 'active' || p.games?.status === 'pending'
+      ) || [];
+
+      const totalDeposited = activeGames.reduce((sum, p) => 
+        sum + parseFloat(p.deposit_amount || 0), 0
+      );
+
+      setUserStats({
+        totalDeposited: totalDeposited.toFixed(2),
+        potentialWinnings: (totalDeposited * 0.1).toFixed(2),
+        activeGames: activeGames.length,
+      });
+    } catch (error) {
+      console.error('Error updating user stats:', error);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -82,13 +169,29 @@ export default function Home() {
             </div>
 
             {/* Tab Content */}
-            {activeTab === 'home' ? (
-              <HomeTab games={games} userStats={userStats} />
+            {loading ? (
+              <div className="flex justify-center items-center h-64">
+                <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-purple-600"></div>
+              </div>
             ) : (
-              <GameActionsTab 
-                games={games} 
-                onGameCreated={(game) => setGames([...games, game])}
-              />
+              <>
+                {activeTab === 'home' ? (
+                  <HomeTab 
+                    games={games} 
+                    userStats={userStats} 
+                    onRefresh={fetchGames}
+                  />
+                ) : (
+                  <GameActionsTab 
+                    games={games} 
+                    onGameCreated={(game) => {
+                      fetchGames(); // Refresh from database
+                      setActiveTab('home');
+                    }}
+                    onRefresh={fetchGames}
+                  />
+                )}
+              </>
             )}
           </>
         )}

@@ -3,9 +3,132 @@
 
 import { useState } from 'react';
 import CreateGameForm from './CreateGameForm';
+import { useAccount } from 'wagmi';
+import { supabase } from '@/lib/supabase';
 
-export default function GameActionsTab({ games, onGameCreated }) {
+export default function GameActionsTab({ games, onGameCreated, onRefresh }) {
+  const { address } = useAccount();
   const [selectedAction, setSelectedAction] = useState(null);
+  const [joining, setJoining] = useState(false);
+  const [joinError, setJoinError] = useState(null);
+  const [showInviteModal, setShowInviteModal] = useState(false);
+  const [inviteCode, setInviteCode] = useState('');
+  const [selectedGame, setSelectedGame] = useState(null);
+
+  const handleJoinClick = () => {
+    setShowInviteModal(true);
+    setInviteCode('');
+    setJoinError(null);
+  };
+
+  const handleJoinWithCode = async () => {
+    if (!inviteCode.trim()) {
+      setJoinError('Please enter an invite code');
+      return;
+    }
+
+    setJoining(true);
+    setJoinError(null);
+    
+    try {
+      // Find game by invite code
+      const { data: game, error: gameError } = await supabase
+        .from('games')
+        .select(`
+          *,
+          creator:users!creator_id(wallet_address, username),
+          game_participants(*)
+        `)
+        .eq('invite_code', inviteCode.toUpperCase())
+        .single();
+
+      if (gameError || !game) {
+        throw new Error('Invalid invite code');
+      }
+
+      // Check if game is joinable
+      if (game.status !== 'pending') {
+        throw new Error('This game has already started');
+      }
+
+      if (game.current_participants >= game.max_participants) {
+        throw new Error('This game is full');
+      }
+
+      // Get or create user
+      let userId;
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('id')
+        .eq('wallet_address', address.toLowerCase())
+        .single();
+      
+      if (existingUser) {
+        userId = existingUser.id;
+      } else {
+        const { data: newUser, error: userError } = await supabase
+          .from('users')
+          .insert([{
+            id: crypto.randomUUID(),
+            wallet_address: address.toLowerCase(),
+            username: `Player${address.slice(-4)}`
+          }])
+          .select()
+          .single();
+          
+        if (userError) throw userError;
+        userId = newUser.id;
+      }
+      
+      // Check if already participating
+      const { data: existingParticipant } = await supabase
+        .from('game_participants')
+        .select('id')
+        .eq('game_id', game.id)
+        .eq('user_id', userId)
+        .single();
+        
+      if (existingParticipant) {
+        throw new Error('You are already in this game!');
+      }
+      
+      // Add participant
+      const { error: participantError } = await supabase
+        .from('game_participants')
+        .insert([{
+          game_id: game.id,
+          user_id: userId,
+          deposit_amount: game.deposit_amount,
+          transaction_hash: `0x${Date.now().toString(16)}` // Temporary
+        }]);
+        
+      if (participantError) throw participantError;
+      
+      // Update game participant count
+      const newParticipantCount = game.current_participants + 1;
+      const { error: updateError } = await supabase
+        .from('games')
+        .update({ 
+          current_participants: newParticipantCount,
+          status: newParticipantCount === game.max_participants ? 'active' : 'pending'
+        })
+        .eq('id', game.id);
+        
+      if (updateError) throw updateError;
+      
+      // Success!
+      setShowInviteModal(false);
+      setInviteCode('');
+      alert(`Successfully joined "${game.name}"!`);
+      if (onRefresh) onRefresh();
+      
+    } catch (error) {
+      console.error('Error joining game:', error);
+      setJoinError(error.message);
+    } finally {
+      setJoining(false);
+    }
+  };
 
   const actionButtons = [
     {
@@ -23,13 +146,6 @@ export default function GameActionsTab({ games, onGameCreated }) {
       description: 'Join an existing game'
     },
     {
-      id: 'view',
-      title: 'View My Active Games',
-      icon: '👁️',
-      color: 'from-green-600 to-green-700',
-      description: 'Check your game progress'
-    },
-    {
       id: 'claim',
       title: 'Claim Winnings',
       icon: '💰',
@@ -40,6 +156,59 @@ export default function GameActionsTab({ games, onGameCreated }) {
 
   return (
     <div className="max-w-4xl mx-auto">
+      {/* Invite Code Modal */}
+      {showInviteModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-xl p-6 max-w-md w-full">
+            <h3 className="text-2xl font-bold text-gray-800 mb-4">Enter Invite Code</h3>
+            <p className="text-gray-600 mb-6">
+              Enter the 6-character code shared by your friend
+            </p>
+            
+            {joinError && (
+              <div className="mb-4 p-3 bg-red-100 text-red-700 rounded-lg text-sm">
+                {joinError}
+              </div>
+            )}
+            
+            <input
+              type="text"
+              value={inviteCode}
+              onChange={(e) => setInviteCode(e.target.value.toUpperCase())}
+              placeholder="ABC123"
+              maxLength={6}
+              className="w-full px-4 py-3 text-center text-2xl font-mono font-bold rounded-lg bg-gray-100 text-gray-900 placeholder-gray-400 border border-gray-300 focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-200 mb-6"
+              disabled={joining}
+            />
+            
+            <div className="flex gap-3">
+              <button
+                onClick={() => {
+                  setShowInviteModal(false);
+                  setInviteCode('');
+                  setJoinError(null);
+                }}
+                disabled={joining}
+                className="flex-1 py-3 px-4 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold rounded-lg transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleJoinWithCode}
+                disabled={joining || inviteCode.length !== 6}
+                className={`flex-1 py-3 px-4 font-bold rounded-lg transition-colors ${
+                  joining || inviteCode.length !== 6
+                    ? 'bg-gray-400 cursor-not-allowed text-gray-600'
+                    : 'bg-blue-600 hover:bg-blue-700 text-white'
+                }`}
+              >
+                {joining ? 'Joining...' : 'Join Game'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Action Selection */}
       {!selectedAction && (
         <div className="bg-white rounded-2xl shadow-lg p-8">
@@ -52,7 +221,13 @@ export default function GameActionsTab({ games, onGameCreated }) {
             {actionButtons.map((action) => (
               <button
                 key={action.id}
-                onClick={() => setSelectedAction(action.id)}
+                onClick={() => {
+                  if (action.id === 'join') {
+                    handleJoinClick();
+                  } else {
+                    setSelectedAction(action.id);
+                  }
+                }}
                 className={`bg-gradient-to-r ${action.color} text-white rounded-xl p-6 text-left hover:shadow-lg transition-all transform hover:-translate-y-1`}
               >
                 <div className="flex items-center justify-between">
@@ -90,89 +265,8 @@ export default function GameActionsTab({ games, onGameCreated }) {
             <div>
               <h2 className="text-2xl font-bold text-gray-800 mb-6">Create New Game</h2>
               <CreateGameForm onGameCreated={(game) => {
-                onGameCreated(game);
-                setSelectedAction(null);
+               if (onGameCreated) onGameCreated(game);
               }} />
-            </div>
-          )}
-
-          {selectedAction === 'join' && (
-            <div>
-              <h2 className="text-2xl font-bold text-gray-800 mb-6">Join a Game</h2>
-              <div className="space-y-4">
-                {games.filter(g => g.status === 'pending').map(game => (
-                  <div key={game.id} className="border rounded-lg p-6 hover:bg-gray-50">
-                    <div className="flex justify-between items-start mb-4">
-                      <div>
-                        <h3 className="text-xl font-bold">{game.name}</h3>
-                        <p className="text-gray-600">Created by {game.creator}</p>
-                      </div>
-                      <span className="px-3 py-1 bg-yellow-100 text-yellow-800 rounded-full text-sm">
-                        {game.participants}/{game.maxParticipants} players
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-2 gap-4 mb-4">
-                      <div>
-                        <p className="text-sm text-gray-600">Deposit Required</p>
-                        <p className="font-bold">{game.depositAmount} ETH</p>
-                      </div>
-                      <div>
-                        <p className="text-sm text-gray-600">Duration</p>
-                        <p className="font-bold">{game.duration}</p>
-                      </div>
-                    </div>
-                    <button className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition-colors">
-                      Join Game
-                    </button>
-                  </div>
-                ))}
-                {games.filter(g => g.status === 'pending').length === 0 && (
-                  <p className="text-center text-gray-500 py-8">No games available to join</p>
-                )}
-              </div>
-            </div>
-          )}
-
-          {selectedAction === 'view' && (
-            <div>
-              <h2 className="text-2xl font-bold text-gray-800 mb-6">My Active Games</h2>
-              <div className="space-y-4">
-                {games.filter(g => g.status === 'active').map(game => (
-                  <div key={game.id} className="border rounded-lg p-6">
-                    <div className="flex justify-between items-start mb-4">
-                      <div>
-                        <h3 className="text-xl font-bold">{game.name}</h3>
-                        <p className="text-gray-600">Duration: {game.duration}</p>
-                      </div>
-                      <span className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-sm">
-                        Active
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-4 mb-4">
-                      <div>
-                        <p className="text-sm text-gray-600">Your Deposit</p>
-                        <p className="font-bold">{game.depositAmount} ETH</p>
-                      </div>
-                      <div>
-                        <p className="text-sm text-gray-600">Total Pot</p>
-                        <p className="font-bold">{(parseFloat(game.depositAmount) * game.participants).toFixed(2)} ETH</p>
-                      </div>
-                      <div>
-                        <p className="text-sm text-gray-600">Players</p>
-                        <p className="font-bold">{game.participants}/{game.maxParticipants}</p>
-                      </div>
-                    </div>
-                    <div className="flex gap-3">
-                      <button className="flex-1 bg-purple-600 hover:bg-purple-700 text-white font-bold py-2 rounded-lg transition-colors">
-                        View Details
-                      </button>
-                      <button className="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-2 rounded-lg transition-colors">
-                        Invite Friends
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
             </div>
           )}
 
